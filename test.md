@@ -1,4 +1,577 @@
 
+# 三、TorchRec 与 DynamicEmb（学习笔记）
+
+> 搞懂"超大 embedding 表怎么在分布式环境里存取"，这是读 GR 适配代码的地基。
+
+## 1.定位：谁管什么
+
+TorchRec = PyTorch 生态里的超大 embedding 表管理系统（Meta 开源，2019），目标是让推荐模型能在多卡/多机上训练。
+
+| 管                                   | 不管                             |
+| ------------------------------------ | -------------------------------- |
+| 表的声明（有哪些表、多大）           | 模型结构（HSTU）                 |
+| 表的切分（哪张表怎么切、切到哪张卡） | 训练循环与优化器（Megatron）     |
+| 切分后查表的通信编排（all-to-all）   | 表的内容与生命周期（DynamicEmb） |
+
+**两个正交维度，可叠加使用**：
+
+* **TorchRec 管「表放在哪里」**——空间维度：切成几份、放在哪几张卡
+* **DynamicEmb 管「表里放什么」**——时间维度：谁进来、谁被淘汰、谁下沉
+
+所以一张表可以既"被按行切成 8 份"，又"每份内部按 LRU 淘汰"。
+
+## 2.五个角色
+
+| 角色                | 是什么             | 干什么                             | 本项目对应                                     |
+| ------------------- | ------------------ | ---------------------------------- | ---------------------------------------------- |
+| `EmbeddingConfig` | 表的"身份证"       | 声明表名、行数、维度、dtype        | `HASH_SIZE`、`item_vocab_size_or_capacity` |
+| `EBC` / `EC`    | 表的**容器** | 声明"用哪几张表、喂哪些特征"       | `EmbeddingCollection`（EC）                  |
+| Planner             | **决策者**   | 算"哪张表用哪种切法、放哪些卡"     | `get_planner`                                |
+| Sharder             | **执行者**   | 真正把表切片、分配到各卡           | `DynamicEmbeddingCollectionSharder`          |
+| DMP                 | **装配者**   | 把 EBC/EC 换成分片版，接管 forward | `apply_dmp`                                  |
+
+## 3.EBC 与 EC
+
+都是 `torchrec` 的 `nn.Module`，职责都是"持有若干张表 + 实现前向查表"。
+
+**唯一区别：查完表之后，要不要把同一特征的多个向量合并掉。**
+
+* **EBC**（`EmbeddingBagCollection`）：**合并**（池化 sum/mean/max），输入 N 个 id 出来 1 个向量
+* **EC**（`EmbeddingCollection`）：**不合并**，输入 N 个 id 出来 N 个向量，序列结构保留
+
+```python
+# 1) 声明表（两者配置类不同）
+from torchrec.modules.embedding_configs import EmbeddingBagConfig, EmbeddingConfig
+
+bag_cfg = EmbeddingBagConfig(name="user_id", num_embeddings=1_000_000,
+                             embedding_dim=64, feature_names=["user_id"])
+seq_cfg = EmbeddingConfig(name="movie_id", num_embeddings=1_000_000,
+                          embedding_dim=64, feature_names=["movie_id"])
+
+# 2) 装成容器
+from torchrec.modules.embedding_modules import EmbeddingBagCollection, EmbeddingCollection
+ebc = EmbeddingBagCollection(tables=[bag_cfg], device=torch.device("npu"))
+ec  = EmbeddingCollection(tables=[seq_cfg],   device=torch.device("npu"))
+
+# 3) 造输入：2 个样本各 3 个 id
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
+kjt = KeyedJaggedTensor.from_lengths_sync(
+    keys=["movie_id"],
+    values=torch.tensor([10, 20, 30,  40, 50, 60]),
+    lengths=torch.tensor([3, 3]),
+)
+
+# 4) 输出差异（全部关键）
+out_ec = ec(kjt)      # Dict[str, JaggedTensor]
+#   values() 形状 [6, 64]   ← 6 个 id → 6 个向量，一个不少
+#   offsets() = [0, 3, 6]   ← 边界保留
+
+out_ebc = ebc(kjt)    # KeyedTensor
+#   values() 形状 [2, 64]   ← 6 个向量被池化成 2 个，序列信息丢了
+```
+
+**结论：HSTU 必须用 EC**——它要对"每一个历史 item"做 attention，用 EBC 池化后序列就塌了。
+
+本项目真实代码（`modules/embedding.py` 的 `ShardedEmbedding.forward`）：
+
+```python
+def forward(self, kjt: KeyedJaggedTensor) -> Dict[str, JaggedTensor]:
+    mp_embeddings_awaitables = self._model_parallel_embedding_collection(kjt)
+    if self._data_parallel_embedding_collection is not None:
+        with torch_npu.npu.stream(self._side_stream):
+            dp_embeddings = self._data_parallel_embedding_collection(kjt)
+        torch_npu.npu.current_stream().wait_stream(self._side_stream)
+        embeddings = {**mp_embeddings_awaitables.wait(), **dp_embeddings}
+    else:
+        embeddings = mp_embeddings_awaitables.wait()
+    return embeddings
+```
+
+三个观察：
+
+1. **返回 `Dict[str, JaggedTensor]`** → 证明用的是 EC 而非 EBC；这正是"稀疏/稠密分界线"：KJT（稀疏侧）进，JaggedTensor（稠密侧）出
+2. **两个 collection 并存**：`_model_parallel_embedding_collection`（要跨卡查的表）与 `_data_parallel_embedding_collection`（每卡一份副本、不跨卡的表）→ "同一模型混用分片策略"落到代码了
+3. **data-parallel 走独立 stream**：它不需要等 all-to-all，可丢到旁路 stream 并发执行，最后 `wait_stream` 汇合，白捡的并行度
+
+## 4.DMP
+
+`DistributedModelParallel`：把已建好的普通模型**就地改造成分片版**，并在 forward 时自动完成跨卡查询。
+
+做三件事：
+
+1. **识别**稀疏模块（靠 `TORCHREC_TYPES = {EmbeddingBagCollection, EmbeddingCollection}`）
+2. **替换**成分片版（用 sharders + plan，表的切片真正发生在这里）
+3. **接管** forward（内部自动发起 all-to-all）
+
+本项目真实用法（`distributed/sharding.py` 的 `apply_dmp`）：
+
+```python
+model = DistributedModelParallel(
+    module=model,               # 原始模型，内部还是完整的 EC
+    device=device,              # torch.device("npu", 0)
+    sharders=sharders,          # [DynamicEmbeddingCollectionSharder(...)]
+    plan=plan,                  # get_planner 产出的分片方案
+    init_data_parallel=True,
+)
+```
+
+**关键是调用方式完全不变**：
+
+```python
+logits = model(batch)              # 分片前 / 分片后写法一样
+raw = model._dmp_wrapped_module    # 需要时能取出原始模型
+```
+
+不用 DMP 就得自己写这些（这就是 DMP 替你干的活）：
+
+```python
+owner = ids_to_rank_range(ids, world_size)      # 1. 算归属
+recv_ids = all_to_all(buckets(ids, owner), pg)  # 2. 分桶 + 去程 all-to-all
+vecs = my_local_table[recv_ids]                 # 3. 查本地表
+back = all_to_all(vecs, pg, reverse=True)       # 4. 回程 all-to-all
+result = unbucketize(back)                      # 5. 重排
+```
+
+（DMP 还要额外处理缓冲区复用、prefetch 流水线、前后向通信顺序、数据并行表的分流。）
+
+## 5.完整流程：单卡模型 → 分布式模型
+
+```
+Step 1  声明表         EmbeddingConfig(name="movie_id", num_embeddings=HASH_SIZE, embedding_dim=64)
+Step 2  组成单卡模型    ec = EmbeddingCollection(tables=[...]); model = MyModel(ec, hstu_block, head)
+Step 3  Planner 出方案  plan = planner.collective_plan(model, sharders, pg)   ← 只产方案，不动机器
+Step 4  Sharder 执行    按 plan 把每张表切成 N 份，各卡拿到自己那份
+Step 5  DMP 装配       model = DistributedModelParallel(module=model, sharders=..., plan=...)
+                       内部把 ec 换成 ShardedEmbeddingCollection，forward 被接管
+```
+
+**Step 5 之后使用方式完全不变**：`model(batch)` 照旧，跨卡查表自动发生。这也解释了为什么适配时 `apply_dmp` 只改了几行。
+
+## 6.四种分片策略
+
+| 策略              | 怎么切               | 每卡存多少                         | 查表通信         | 用在哪                       | 代价                                      |
+| ----------------- | -------------------- | ---------------------------------- | ---------------- | ---------------------------- | ----------------------------------------- |
+| `TABLE_WISE`    | 按**表**切     | 整张表放某一张卡                   | 要（all-to-all） | 表**多**但每张不大     | 通信；负载可能不均                        |
+| `ROW_WISE`      | 按**行**切     | `num_embeddings / world_size` 行 | 要（all-to-all） | 单表**极大**（最常用） | 通信 + 需重排结果                         |
+| `COLUMN_WISE`   | 按**列**切     | `embedding_dim / world_size` 列  | 要且更复杂       | 行数不多、**维度极大** | 查完要 all-gather 拼维度，池化还要 reduce |
+| `DATA_PARALLEL` | 不切，**复制** | 完整一份副本                       | **不需要** | 表**很小**             | 费显存（N 倍），但零通信                  |
+
+要点：
+
+* **优先选零通信的**：小表复制 N 份也就几 KB/MB，换查表零通信，很划算
+* **同一模型可混用**：本项目就是（11 行的表走 `DATA_PARALLEL`，百万行的表走 `ROW_WISE`）
+* `COLUMN_WISE` 少用：通信步骤多（all-gather 拼维度 + 可能的 reduce），延迟高
+* 进阶：**表融合**——多张小 row-wise 表打包成一张大表统一切，一次 all-to-all 处理所有表。本项目未用到
+
+## 7.all-to-all 完整机制（7 步）
+
+设 `world_size=4`，按行切，本 batch 要查 **100 个 id**：
+
+```
+Step 1  索引换算        batch 的 id → 行号 → 归属哪张卡
+Step 2  分桶            按归属卡分成 4 个桶（卡0:30、卡1:25、卡2:20、卡3:25）
+Step 3  去程 all-to-all 每卡把"桶i"发给卡i，同时收下归自己的 id
+Step 4  本地查表        各卡查自己存的那段行
+Step 5  回程 all-to-all 把结果发回原来要它的卡
+Step 6  重排            还原成 batch 原始顺序
+Step 7  输出            100 个向量，与输入一一对应
+```
+
+**为什么便宜**：通信量 ∝ **本 batch 命中的 id 数**（100），不是表的总大小（几亿行）。
+
+|          | 稀疏侧（查表）       | 稠密侧（数据并行）                |
+| -------- | -------------------- | --------------------------------- |
+| 通信原语 | **all-to-all** | **all-reduce / all-gather** |
+| 通信量   | ∝ 命中的 id 数      | ∝**全部参数量 / 数据量**   |
+
+**这就是"稀疏/稠密必须两套并行策略"的根本原因——通信模式完全不同。**
+
+**prefetch（流水线）**：把这一批拆成若干小批，第 1 批在算的时候第 2 批在传，让通信和计算重叠。
+
+## 8.planner 如何决策
+
+四步：前三步"枚举 + 打分"，第四步才是决策。
+
+### Step 0 约束先过滤候选（本项目里这步几乎锁死了决策权）
+
+`get_planner` 按表名分三类，注意 `sharding_types=[...]` **只有一个元素**——不是建议，是候选集合只有一项：
+
+| 表的分类                                     | 被允许的候选                                                               |
+| -------------------------------------------- | -------------------------------------------------------------------------- |
+| 在`data_parallel_embedding_table_names` 里 | 只有`DATA_PARALLEL` + `use_dynamicemb=False`                           |
+| 在`dynamicemb_options_dict` 里             | 只有`ROW_WISE` + 动态表配置                                              |
+| 其他                                         | 只有`ROW_WISE` + `use_dynamicemb=False`（save/load 不支持 table-wise） |
+
+**洞察：本项目里 planner 已退化成"执行器"**，决策权被人工约束拿走——说明自动决策在工程上不够可靠，生产上常人工钉死。
+
+### Step 1 枚举候选
+
+每个候选 = `(切法 sharding_type) × (查表内核 compute_kernel) × (分配到哪些 rank)`
+
+干这事的是 **enumerator**：
+
+```python
+enumerator = DynamicEmbeddingEnumerator(topology=topology, constraints=constraints)
+```
+
+### Step 2 打分：两项成本
+
+**A. storage（内存）**
+
+```
+原表大小 = num_embeddings × embedding_dim × dtype_size
+row_wise      → 每卡 = 原表 / world_size
+data_parallel → 每卡 = 原表（每卡一份完整的）
+```
+
+**B. perf（通信）**——与硬件拓扑强相关，代码里带着带宽参数：
+
+```python
+ddr_cap: int = 512 * 1024 * 1024 * 1024,  # 假设一个节点 512GB 内存
+intra_host_bw: int = 450e9,               # 节点内 450 GB/s（NVLink）
+inter_host_bw: int = 25e9,                # 节点间 25 GB/s（网卡）
+```
+
+节点内 450 GB/s vs 节点间 25 GB/s，**差 18 倍**。同样传 1 GB：节点内约 2.2ms，节点间要 40ms。所以 planner 会尽量把"频繁查表的大表"放在同一节点内，并评估表下沉主机内存的容量上限（`ddr_cap`）。
+
+### Step 3 全局选择（真正的决策）
+
+> 给每张表挑一个候选 + 决定放哪些卡，使**每张卡内存 ≤ HBM 上限**，且**峰值通信代价最小**。
+
+这是**装箱问题**（NP-hard），TorchRec 用**动态规划 / 贪心**求近似解：逐表决策、记录各卡占用、内存不超限是硬约束、在可行解里挑通信最省的。产出 `plan`（哪张表 / 哪种切法 / 放哪些卡），再喂给 sharder 和 DMP。
+
+### 经验规则：什么样的表用什么切法
+
+| 表的特征                          | 建议切法                       | 账怎么算                               |
+| --------------------------------- | ------------------------------ | -------------------------------------- |
+| **小表**（复制 N 份放得下） | `DATA_PARALLEL`              | 复制的代价可忽略，换零通信             |
+| **行数多、维度正常**        | `ROW_WISE`                   | 内存摊薄 N 倍；通信量只 ∝ 命中 id 数  |
+| 行数不多、**维度极大**      | `COLUMN_WISE`                | 按行切每卡仍很大，按列切才摊得开       |
+| 表多、每张都不大                  | `TABLE_WISE`（或融合后切行） | 一张表放一张卡，避免每张都切           |
+| 持续增长、极稀疏                  | `ROW_WISE` + 动态表          | 静态表装不下新 id（DynamicEmb 的领域） |
+
+### 用本项目真实数字走一遍（假设 dim=64、fp32）
+
+**`movie_id` 表**：`num_embeddings = HASH_SIZE`，8 卡
+
+```
+1000 万行时：单表 = 1000万 × 64 × 4 = 2.56 GB
+   data_parallel → 每卡 2.56 GB，8 卡共 20 GB   ← 爆显存
+   row_wise      → 每卡 320 MB
+100 万行时：单表 = 100万 × 64 × 4 = 256 MB
+   row_wise      → 每卡 32 MB
+→ 选 ROW_WISE：内存摊薄 8 倍，代价是稀疏通信
+```
+
+**`action_weights` 表**：`num_embeddings = 11`（电影评分只有 11 种）
+
+```
+单表 = 11 × 64 × 4 = 2816 字节 ≈ 2.8 KB
+   data_parallel → 每卡 2.8 KB，零通信         ← 完胜
+   row_wise      → 每卡 0.35 KB，但每次查表走一次 all-to-all
+→ 为省 2.5 KB 花一次通信，不划算
+```
+
+**结论：不是看内存绝对值，而是看"复制一份的代价" vs "通信一次的代价"哪个更小。**
+
+## 9.KJT 与 JaggedTensor
+
+**问题**：一个 batch 里 32 个用户，A 看了 3 个 item、B 看了 100 个、C 看了 7 个，怎么塞进一个张量？
+
+* 笨办法：补齐到 100（padding）——费显存、白算、还要记 mask
+* 聪明办法：把所有人的行为**首尾相接**排成一条长序列，再记每个人的**边界**
+
+**Jagged Tensor（锯齿张量）= values + offsets**：
+
+```
+values  = [v1, v2, v3, v4, v5, ..., v110]     ← 所有人行为首尾相接
+offsets = [0,   3,   103,  110]               ← 每个人的起点
+
+用户A = values[0:3]、用户B = values[3:103]、用户C = values[103:110]
+```
+
+**KJT = Keyed Jagged Tensor = 带特征名的 Jagged Tensor**。因为模型一次不止一条序列（item 序列 / action 序列 / contextual 特征），要多带两层信息：
+
+```
+keys    = ["item", "action", "contextual"]   ← 特征名
+values  = [ 所有序列的值拼在一起 ]
+lengths = [ 每个特征、每个样本各有多长 ]     ← 一维展平
+offsets = [ lengths 累加出来的起点 ]
+```
+
+**小例子（batch = 2，3 个特征）**：
+
+| 特征       | 用户0 的 id 序列 | 用户1 的 id 序列 |
+| ---------- | ---------------- | ---------------- |
+| item       | `[11, 25]`     | `[7]`          |
+| action     | `[3, 3]`       | `[1, 5, 9]`    |
+| contextual | `[99]`         | `[42]`         |
+
+拼成的 KJT（注意**先按特征分组，特征内再按 batch 排**）：
+
+```python
+keys    = ["item", "action", "contextual"]
+
+values  = [ 11, 25,  7,  |  3, 3,  1, 5, 9,  |  99, 42 ]
+#           └─ item ─┘     └──── action ────┘    └ ctx ┘
+
+lengths = [ 2, 1,  |  2, 3,  |  1, 1 ]
+#          item0 item1  act0 act1  ctx0 ctx1
+
+offsets = [0, 2, 3, 5, 8, 9, 10]   # lengths 前缀和，多一个哨兵位
+```
+
+取用时的对应关系：
+
+```python
+batch = 2   # 特征 k、样本 b 的区间 = values[offsets[b + k*batch] : offsets[b + 1 + k*batch]]
+
+# item(第0个特征) 用户1(b=1)：values[offsets[1]:offsets[2]] = values[2:3] = [7]
+# action(第1个特征) 用户0(b=0)：values[offsets[2]:offsets[3]] = values[3:5] = [3, 3]
+# action(第1个特征) 用户1(b=1)：values[offsets[3]:offsets[4]] = values[5:8] = [1, 5, 9]
+```
+
+这就是为什么要 `keys + lengths + offsets` 三件套：**keys 定位是哪个特征，lengths 定位每个样本多长，offsets 定位在 values 里的绝对区间**。
+
+**为什么 offsets 是核心**：切片、拼接、转稠密（padded dense）全靠它划边界。这就是为什么 patch 里要专门新建 `pt_jagged_tensors.py`（246 行，单文件最长）。
+
+|              | **KJT**        | **JaggedTensor**           |
+| ------------ | -------------------- | -------------------------------- |
+| 装什么       | **id**（整数） | **embedding 向量**（浮点） |
+| 谁产生       | 数据加载 / 预处理    | 查完表之后                       |
+| 属于哪个世界 | **稀疏侧**     | **稠密侧**                 |
+
+```
+KJT ──[查 embedding 表]──> JaggedTensor
+```
+
+## 10.本项目真实配置
+
+`training/utils.py` 的 `get_dataset_and_embedding_args()`（ml-20m 分支）：
+
+| 表名               | 特征         | 容量          | 分片类型          | 改动                                                                                      |
+| ------------------ | ------------ | ------------- | ----------------- | ----------------------------------------------------------------------------------------- |
+| `action_weights` | `rating`   | **11**  | `data_parallel` | `EmbeddingArgs` → `DynamicEmbeddingArgs`；新增 `item_vocab_gpu_capacity_ratio=0.5` |
+| `movie_id`       | `movie_id` | `HASH_SIZE` | 未显式指定        | `caching` True→**False**                                                         |
+| `user_id`        | `user_id`  | `HASH_SIZE` | 未显式指定        | `caching` True→**False**                                                         |
+
+四条观察：
+
+1. `action_weights` 完美印证第 8 节规律——`rating` 只有 11 种取值，表小到可忽略，走 `data_parallel` 零通信
+2. `movie_id` / `user_id` 是真正的动态大表，走 `ROW_WISE` + DynamicEmb 淘汰；**未指定 sharding_type** → 交给 planner 决策
+3. `caching` 被强制关闭，注释写明"NPU 暂不支持 caching" → **能力边界，不是性能选择**
+4. `HASH_SIZE` 从 1000 万改到 100 万，缩小 10 倍 → 更容易触发淘汰/哈希冲突，**这类改动只靠精度对比才能验证**
+
+动态表参数（`create_dynamic_optitons_dict`）：
+
+```python
+global_hbm_for_values=embedding_args.global_hbm_for_values,
+evict_strategy=DynamicEmbEvictStrategy.LRU if embedding_args.evict_strategy == "lru" ...,
+safe_check_mode=DynamicEmbCheckMode.IGNORE,
+bucket_capacity=128,
+training=training,
+caching=False,   # NPU 暂不支持 caching
+```
+
+**本项目已知的 NPU 能力边界（都写在代码注释里）**：
+
+* `caching=False` —— 暂不支持 caching
+* `pipeline_type="none"` —— 暂不支持流水线（上游是 `"prefetch"`）
+* 只保留 `DynamicEmbeddingCollectionSharder` —— 不支持 BagCollection 那条路
+* table-wise 被禁用 —— save/load 不支持 table-wise 分片
+* 只有 `DynamicEmbeddingArgs` —— NPU 暂仅支持这一类表参数
+
+## 11.DynamicEmb 深挖
+
+> 第 1–10 节讲的是 TorchRec 怎么把表**切开放**；这一节讲 DynamicEmb 怎么决定表里**放什么**。
+
+### 11.1 一句话定位
+
+> **TorchRec 解决"一张表装不下单卡显存"，DynamicEmb 解决"一堆表加起来装不下所有卡显存"。**
+
+前者是**空间**问题（切开、分散），后者是**时间**问题（谁进表、谁被挤出去）。两者正交，可叠加。
+
+### 11.2 静态表的三个死结
+
+TorchRec 的表是 `num_embeddings × dim` 一块固定内存，全程常驻 HBM，有三个致命伤：
+
+| 死结                       | 说明                                                                                                                    |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| **容量是"拍"出来的** | `HASH_SIZE` 得预估：估小了哈希冲突、新 id 插不进去；估大了白占显存。第 10 节那次 `10_000_000 → 10_000_00` 就是典型 |
+| **幂律分布被浪费**   | 90% 的请求打在前 1% 的热 id 上，冷 id 占 99% 空间却几乎不被查                                                           |
+| **多表叠加爆炸**     | 单表能切，但 user_id + movie_id + item_vocab + … 加起来超了，切开也没用                                                |
+
+DynamicEmb 的解法：**表不再是"一块连续显存"，而是一个可增删的哈希表**——热留在 HBM、冷下沉到 DDR、太冷的直接删。
+
+### 11.3 表结构：一张表 = 一堆桶
+
+理解一切的起点。底层是 HKV 的哈希表，**不是** `nn.Embedding` 那种 `[num_embeddings, dim]` 矩阵：
+
+```
+表 = 哈希桶数组
+     ┌──────────┬──────────┬──────────┬─────
+     │  bucket  │  bucket  │  bucket  │ ...
+     │ (128 槽) │ (128 槽) │ (128 槽) │
+     └──────────┴──────────┴──────────┴─────
+      每个槽 = { key, emb[dim], optstate, score }
+```
+
+* **`bucket_capacity=128`**：每桶 128 个槽位（本项目值），查表以"桶"为单位找 key
+* **key 是哈希值**，不是原始 id → 任意 id 都能进表，只要哈希不撞
+* **槽是懒分配的**：桶初始为空，容量随插入增长（`init_capacity → max_capacity`）
+
+**为什么按桶组织**：NPU 上要并行访存，同桶的槽放一起才能一次读入批量比对 key（HKV 用 digest 做乐观并发）。
+
+### 11.4 每个槽里的三样东西
+
+| 数组         | 内容             | 作用                                       |
+| ------------ | ---------------- | ------------------------------------------ |
+| `emb`      | `dim` 个浮点数 | 查表结果，即嵌入向量                       |
+| `optstate` | Adam 的 m / v 等 | **优化器状态也存在表里**，跟着槽走   |
+| `score`    | 一个整数         | 淘汰打分依据（LRU 记访问时间，LFU 记频次） |
+
+`optstate` 在表里这点很关键：**Adam 的动量必须和嵌入同生共死**。向量被淘汰了状态还在，下次 id 回来会带着陈旧动量训练，精度会飘。所以 `DynamicEmbDump/Load` 都带 `optim=True`。
+
+`score` 是淘汰算法的输入——**没有 score 就没法淘汰**，这是 DynamicEmb 比静态表多出来的那部分开销。
+
+### 11.5 分层存储：`global_hbm_for_values`
+
+```
+      HBM  ┌─────────────────────────┐
+   快但小  │  key index + 热 value   │  ← global_hbm_for_values 划这条线
+           ├─────────────────────────┤
+     DDR  │       温 value          │
+   慢但大  ├─────────────────────────┤
+     磁盘  │       冷 value          │
+           └─────────────────────────┘
+```
+
+* **key index 常驻 HBM** —— 查找路径要快，key 不能下沉
+* **value 的 HBM 预算由 `global_hbm_for_values` 控制**，超出部分下沉
+* 本项目用 `item_vocab_gpu_capacity_ratio=0.5` 表达：**表容量的 50% 放 HBM**，剩下一半留给 DDR
+
+对照第 8 节：`data_parallel` vs `row_wise` 是**跨卡**取舍，这里是**跨存储层级**取舍，又多了一个维度。
+
+### 11.6 淘汰：表满之后怎么办
+
+表有 `max_capacity`。满了要插新 key，就得先踢一个旧的，策略由 `evict_strategy` 定：
+
+| 策略          | 依据           | 适合                           |
+| ------------- | -------------- | ------------------------------ |
+| **LRU** | 最久没被访问的 | 兴趣随时间漂移（本项目的选择） |
+| **LFU** | 访问次数最少的 | 长尾稳定、热点固定             |
+
+淘汰粒度是**槽**，腾出来的槽给新 key 用。**这就是"动态"的含义**：表的大小和内容都在变。
+
+⚠️ 淘汰是**有损的**。被淘汰的 id 下次再出现，嵌入从初始值重来（本项目用 `DynamicEmbInitializerMode.UNIFORM`）。所以：
+
+* 淘汰太频繁 → 模型反复"遗忘"，**精度劣化但不报错**
+* 这正是第 10 节"HASH_SIZE 缩小 10 倍**只能靠精度对比验证**"的根因
+
+`safe_check_mode=DynamicEmbCheckMode.IGNORE` 意味着**不因为插不进去而报错**——静默容忍，性能优先。这也解释了为什么容量改错不会崩。
+
+### 11.7 一次 forward 的完整路径
+
+输入仍是 TorchRec 的 KJT（这就是"KJT 在稀疏侧"的意义），但查表被换掉了：
+
+```
+KJT(ids)
+  │
+  ├─ 1. unique 去重          ← use_index_dedup=True
+  │      batch 里重复 id 只查一次
+  ├─ 2. bucketize            按哈希分到各桶
+  ├─ 3. find + insert missing
+  │      命中的直接取；没命中的新 id 现场建槽
+  │      表满 → evict 一个旧槽
+  ├─ 4. gather emb           从 emb 数组取向量
+  └─ 5. expand 回原顺序       去重的逆操作
+       │
+       ▼
+   Dict[str, JaggedTensor]    ← 稠密侧，序列结构保留（EC 不池化）
+```
+
+反向是 `dynamic_emb_update`：按槽**原地**更新 `emb` 和 `optstate`，同时刷 `score`——表内原地更新，不走传统那套全量梯度同步。
+
+### 11.8 与 TorchRec 的四个接口
+
+DynamicEmb 不重造轮子，**继承 TorchRec 的抽象、只换实现**。即约束/枚举器/规划器/执行器等。`torch_rec_v2_examples/little_demo/model.py` 最清楚：
+
+| TorchRec 抽象                  | DynamicEmb 版本                       | 换成什么了                                                    |
+| ------------------------------ | ------------------------------------- | ------------------------------------------------------------- |
+| `ParameterConstraints`       | `DynamicEmbParameterConstraints`    | 多了`dynamicemb_options`；**约束必须含 `ROW_WISE`** |
+| `EmbeddingEnumerator`        | `DynamicEmbeddingEnumerator`        | 候选枚举只留动态表能走的分片                                  |
+| `EmbeddingShardingPlanner`   | `DynamicEmbeddingShardingPlanner`   | 打分时把动态表当不可切                                        |
+| `EmbeddingCollectionSharder` | `DynamicEmbeddingCollectionSharder` | 建表时创建哈希表而非 Tensor                                   |
+
+```python
+DynamicEmbParameterConstraints(
+    sharding_types=[ShardingType.ROW_WISE.value],   # 动态表只能按行切
+    compute_kernels=["fused"],                       # 用融合算子
+    dynamicemb_options=DynamicEmbTableOptions(
+        initializer_args=DynamicEmbInitializerArgs(mode=...),  # 新 id 怎么初始化
+        training=training,                                     # 决定要不要 optstate
+    ),
+)
+```
+
+另有 `use_index_dedup=True` —— 决定 11.7 第 1 步要不要去重，省的是 gather 的量。
+
+**容器仍是原生 `EmbeddingCollection`**（`EmbeddingCollection(tables=eb_configs)`），只有 Sharder 是动态的——印证第 9 节"KJT 进、JaggedTensor 出"的边界没变。
+
+### 11.9 训练 / 推理 / Checkpoint
+
+`DynamicEmbTableOptions.training` 是个**语义开关**：
+
+|                  | `training=True` | `training=False` |
+| ---------------- | ----------------- | ------------------ |
+| 分配`optstate` | 是                | 否                 |
+| 支持反向更新     | 是                | 否（只读）         |
+| 显存占用         | 高（约 3×）      | 低（只存 emb）     |
+
+**Checkpoint 是 DynamicEmb 最容易踩的坑**（`little_demo/main.py` 的注释）：
+
+```python
+# ShardedDynamicEmbeddingCollection.state_dict() will return a dummy tensor.
+torch.save({...})                                          # ← 存不到嵌入！只是占位
+DynamicEmbDump(save_dir/"dynamicemb", model, optim=True)   # ← 嵌入从这条路径走
+```
+
+|                                    | 存什么                                             | 怎么存               |
+| ---------------------------------- | -------------------------------------------------- | -------------------- |
+| `torch.save(model.state_dict())` | 稠密层权重                                         | 常规                 |
+| `DynamicEmbDump`                 | **动态表的全部槽**（emb + optstate + score） | 每 rank 存自己那部分 |
+
+加载必须 `DynamicEmbLoad(..., optim=True)`，且 `model.load_state_dict(..., strict=False)`（因为 state_dict 里没有嵌入）。**忘记 Dump 就会静默丢失整个嵌入表**——`strict=False` 不报错，直接从头训。
+
+### 11.10 本项目（RecSDK v2）的适配点
+
+Python 层沿用，**C++ 算子层全部用 Ascend C 重写**：
+
+| 改动                                                         | 位置                             | 性质                                           |
+| ------------------------------------------------------------ | -------------------------------- | ---------------------------------------------- |
+| 导入路径`dynamicemb.*` → `dynamic_emb.*`                | `sharding.py` / `utils.py`   | 工程迁移                                       |
+| 新增`initializer_args`（UNIFORM 显式指定）                 | `create_dynamic_optitons_dict` | **精度对齐**：默认初始化不确定，必须钉死 |
+| `caching` True → **False**                          | 同上                             | **能力边界**，NPU 未实现                 |
+| `DynamicEmbeddingArgs` + `item_vocab_gpu_capacity_ratio` | `utils.py`                     | 新增分层容量语义                               |
+| `dynamic_emb_extensions`：17 个基于 HKV 的 Ascend C 算子   | 独立算子库                       | **重写**，不走 CUDA                      |
+
+**全下沉的脉络**：v1 里哈希 / 去重 / 分桶在 CPU 上（`torchrec_embcache` / `hybrid_torchrec`），v2 把 11.7 那一整条链路搬到 NPU。这也是 v2 只能跑 A5 的根本原因——**不是软件挑硬件，是算子按 A5 编的**。
+
+## 12.记忆锚点
+
+1. **TorchRec 管"表放哪里"（空间），DynamicEmb 管"表里放什么"（时间）**——正交，可叠加
+2. 五个角色：Config 声明 → Planner 决策 → Sharder 执行 → DMP 装配；EBC/EC 是容器
+3. EBC 会池化掉序列，**HSTU 必须用 EC**
+4. 四种切法：**小表复制（零通信）、大表按行切（all-to-all）、多表按表切、大维度按列切**
+5. all-to-all = **分桶 → 去程 → 本地查 → 回程 → 重排**，通信量只跟"命中的 id 数"成正比
+6. planner = **枚举候选 + 打分（内存 + 通信÷带宽）+ 装箱求解**；本项目因约束把候选钉死，planner 退化为执行器
+7. 变长序列 = **values + offsets**；KJT 是"带特征名的变长稀疏张量"，在稀疏侧
+8. 动态表 = **哈希桶**，桶里 128 槽，槽 = `{key, emb, optstate, score}`
+9. **optstate 跟着槽走** → 淘汰即丢状态，`Dump/Load` 必须 `optim=True`
+10. `global_hbm_for_values` 划 **HBM/DDR 分界线**，`evict_strategy` 决定**谁出局**
+11. 动态表查表 = **去重 → 分桶 → 查+补 → gather → 展开**，约束必须是 `ROW_WISE`
+12. **淘汰是有损的、静默的**——容量类改动只能靠精度对比验证
+
 # 四、GR 适配源码精读（模块二 · 第 3 课：`pt_ops` 变长算子重写）
 
 > 位置：`examples/hstu/ops/pt_ops/`
